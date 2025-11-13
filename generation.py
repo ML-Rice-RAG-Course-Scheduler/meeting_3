@@ -30,4 +30,3 @@ def generate_answer(user_query):
 
 print(generate_answer("What courses are about African religions?"))
 print("\nClasses: ")
-print(answer)
