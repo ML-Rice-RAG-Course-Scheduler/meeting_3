@@ -39,7 +39,7 @@ Consider Rice University context and common catalog language (e.g., "Distributio
 Infer relevant synonyms 
 """
     response = ollama.generate(
-        model="gemma2:9b",  # <-- must match exactly what you pulled
+        model="llama3:latest",
         prompt=EXPANSION_SYSTEM + "\n" + user_prompt,
         options={"temperature": 0.2}
     )
