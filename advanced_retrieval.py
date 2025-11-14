@@ -207,12 +207,13 @@ def expanded_retrieve(raw_query: str, base_where=None, top_k=10):
 
     # Merge facet filters with any caller-provided filters
     facets = exp.get("facet_filters") or {}
-    where_from_facets = _facet_to_where(facets)
 
-    if base_where and where_from_facets:
-        where = {"$and": [base_where, where_from_facets]}
+    # If the caller supplied base_where, treat it as the source of truth
+    if base_where is not None:
+        where = base_where
     else:
-        where = base_where or where_from_facets
+        where_from_facets = _facet_to_where(facets)
+        where = where_from_facets
 
     fused = query_chroma_multi(collection, candidate_queries, where=where, n_results=25)
 
@@ -221,7 +222,6 @@ def expanded_retrieve(raw_query: str, base_where=None, top_k=10):
     fused = _exclude_never_have(fused, never_have)
 
     return exp, fused[:top_k]
-
 # Example base_where and query usage
 base_where = {
     "$and": [
@@ -231,7 +231,7 @@ base_where = {
 }
 
 expansion, results = expanded_retrieve(
-    "Give me a math course that does not include Linear Algebra",
+    "Give me math courses that are not Linear Algebra",
     base_where=base_where,
     top_k=10
 )
