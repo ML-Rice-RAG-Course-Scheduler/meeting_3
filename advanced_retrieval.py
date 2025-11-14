@@ -1,9 +1,12 @@
 from sentence_transformers import SentenceTransformer
 from ollama import Client
 import chromadb, json, re
+from collections import defaultdict
+from math import inf
+import pandas as pd
 
+# Embedding + DB + LLM clients
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
 client = chromadb.PersistentClient(path="./rice_courses_db")
 collection = client.get_or_create_collection("rice_courses")
 ollama = Client(host="http://localhost:11434")
@@ -15,12 +18,14 @@ Output valid JSON ONLY with these keys:
 - expanded_queries: array of 3-6 diverse phrasings capturing synonyms and likely intents
 - must_have_keywords: up to 5 essential keywords/phrases
 - nice_to_have_keywords: up to 10 optional keywords/phrases
+- never_have_keywords: optional array of 0-10 keywords/phrases that the user explicitly wants to avoid
+  (only use this when the user clearly excludes something with language like "not", "except", "without", "but not", "no X")
 - facet_filters: object with zero or more of:
   { "distribution_group": string,
     "diversity_credit": boolean,
     "department": string,
     "level": string,  // e.g., "100/200/300/400" or "grad/undergrad"
-    "program": string // e.g., "ASIA", "HUMA", etc.
+    "program": string // e.g.,
   }
 Only produce compact JSON—no explanations.
 """
@@ -31,10 +36,10 @@ Raw user query:
 {raw_query}
 
 Consider Rice University context and common catalog language (e.g., "Distribution Group I/II/III", "Diversity Credit").
-Infer relevant synonyms (e.g., "Asian diaspora" ↔ "Asian American studies", "migration", "transnational", "diasporic communities", "ethnic studies").
+Infer relevant synonyms 
 """
     response = ollama.generate(
-        model="llama3:latest",
+        model="gemma2:9b",  # <-- must match exactly what you pulled
         prompt=EXPANSION_SYSTEM + "\n" + user_prompt,
         options={"temperature": 0.2}
     )
@@ -44,30 +49,72 @@ Infer relevant synonyms (e.g., "Asian diaspora" ↔ "Asian American studies", "m
     json_str = re.search(r'\{.*\}', text, flags=re.S).group(0)
     return json.loads(json_str)
 
-from collections import defaultdict
-from math import inf
-
 def _facet_to_where(facets: dict):
-    if not facets: 
+    if not facets:
         return None
-    where = {"$and": []}
+
+    filters = []
+
     for k, v in facets.items():
-        if v is None: 
+        if v is None:
             continue
+
+        # Handle list vs scalar
+        is_list = isinstance(v, (list, tuple))
+
         # Map your schema carefully; adjust keys to your metadata field names
         if k == "diversity_credit":
-            where["$and"].append({"diversity_credit": {"$eq": bool(v)}})
+            filters.append({"diversity_credit": {"$eq": bool(v)}})
+
         elif k == "distribution_group":
-            where["$and"].append({"distribution_group": {"$eq": str(v)}})
+            if is_list:
+                filters.append({
+                    "distribution_group": {"$in": [str(x) for x in v]}
+                })
+            else:
+                filters.append({
+                    "distribution_group": {"$eq": str(v)}
+                })
+
         elif k == "department":
-            where["$and"].append({"department": {"$eq": str(v)}})
+            if is_list:
+                filters.append({
+                    "department": {"$in": [str(x) for x in v]}
+                })
+            else:
+                filters.append({
+                    "department": {"$eq": str(v)}
+                })
+
         elif k == "level":
-            where["$and"].append({"level": {"$eq": str(v)}})
+            if is_list:
+                filters.append({
+                    "level": {"$in": [str(x) for x in v]}
+                })
+            else:
+                filters.append({
+                    "level": {"$eq": str(v)}
+                })
+
         elif k == "program":
-            where["$and"].append({"program": {"$eq": str(v)}})
-    if not where["$and"]:
+            if is_list:
+                filters.append({
+                    "program": {"$in": [str(x) for x in v]}
+                })
+            else:
+                filters.append({
+                    "program": {"$eq": str(v)}
+                })
+
+    if not filters:
         return None
-    return where
+
+    # If only one condition, return it directly (no $and)
+    if len(filters) == 1:
+        return filters[0]
+
+    # Otherwise, combine with $and
+    return {"$and": filters}
 
 def _encode(q: str):
     return embedder.encode([q], normalize_embeddings=True)[0]
@@ -96,9 +143,14 @@ def rrf_fuse(result_lists, k=10, k_rrf=60):
     final = []
     for (rid, doc), fused_score in ordered[:k]:
         meta, orig_score = payload[(rid, doc)]
-        final.append({"id": rid, "doc": doc, "meta": meta, "fused_score": fused_score, "orig_score": orig_score})
+        final.append({
+            "id": rid,
+            "doc": doc,
+            "meta": meta,
+            "fused_score": fused_score,
+            "orig_score": orig_score
+        })
     return final
-
 
 def query_chroma_multi(collection, queries, where=None, n_results=20):
     result_lists = []
@@ -114,11 +166,35 @@ def query_chroma_multi(collection, queries, where=None, n_results=20):
         docs = res["documents"][0]
         metas = res["metadatas"][0]
         dists = res["distances"][0]  # smaller is closer for Chroma cosine? (check your distance metric)
-        # Convert distance to a similarity-like number if you want (optional)
         out = list(zip(ids, dists, metas, docs))
         result_lists.append(out)
     fused = rrf_fuse(result_lists, k=10)
     return fused
+
+def _exclude_never_have(results, never_have_keywords):
+    """
+    Post-filter: remove any results whose text matches any of the forbidden phrases.
+    """
+    if not never_have_keywords:
+        return results
+
+    forbidden = [kw.strip().lower() for kw in never_have_keywords if kw.strip()]
+    if not forbidden:
+        return results
+
+    def is_forbidden_hit(r):
+        meta = r.get("meta") or {}
+        text_parts = [
+            meta.get("title", ""),
+            meta.get("course", ""),
+            meta.get("description", ""),
+            r.get("doc") or "",
+        ]
+        text = " ".join(text_parts).lower()
+        return any(f in text for f in forbidden)
+
+    return [r for r in results if not is_forbidden_hit(r)]
+
 def expanded_retrieve(raw_query: str, base_where=None, top_k=10):
     exp = expand_query_with_llm(raw_query)
 
@@ -129,11 +205,10 @@ def expanded_retrieve(raw_query: str, base_where=None, top_k=10):
     if exp.get("expanded_queries"):
         candidate_queries.extend(exp["expanded_queries"])
 
-    # Optional: prepend “query:” if you switch to an E5 model later
-    # candidate_queries = [f"query: {q}" for q in candidate_queries]
-
     # Merge facet filters with any caller-provided filters
-    where_from_facets = base_where
+    facets = exp.get("facet_filters") or {}
+    where_from_facets = _facet_to_where(facets)
+
     if base_where and where_from_facets:
         where = {"$and": [base_where, where_from_facets]}
     else:
@@ -141,21 +216,26 @@ def expanded_retrieve(raw_query: str, base_where=None, top_k=10):
 
     fused = query_chroma_multi(collection, candidate_queries, where=where, n_results=25)
 
-    # Optional keyword post-filter (strong “must-have” curation)
-    
+    # Apply optional "never-have" keyword post-filter
+    never_have = exp.get("never_have_keywords") or []
+    fused = _exclude_never_have(fused, never_have)
 
     return exp, fused[:top_k]
 
+# Example base_where and query usage
 base_where = {
     "$and": [
-        {"distribution_group": {"$eq": "Distribution Group II"}},
+        {"distribution_group": {"$eq": "Distribution Group III"}},
         {"diversity_credit": {"$eq": False}}
     ]
 }
 
-expansion, results = expanded_retrieve("Give me a history class that is not about european hstory and also not russia and ukraine", base_where=base_where, top_k=10)
+expansion, results = expanded_retrieve(
+    "Give me a math course that does not include Linear Algebra",
+    base_where=base_where,
+    top_k=10
+)
 
-import pandas as pd
 df = pd.DataFrame([{
     "id": r["id"],
     "title": r["meta"].get("title"),
